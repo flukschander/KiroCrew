@@ -62,6 +62,13 @@ logger = logging.getLogger(__name__)
 # Any file older than this threshold is garbage regardless of PID liveness.
 _LAUNCHER_MAX_AGE_SECONDS = 3600
 
+# Bind-mount source temps staged by the Linux namespace launcher live as long
+# as the sandboxed agent runs, which can be hours — so PID liveness, not age,
+# is the primary reclaim signal. Age is only the backstop for a PID that was
+# recycled after the launcher died, hence a threshold well beyond any launcher
+# lifetime rather than the 1h used for exec-once launcher scripts.
+_SB_MOUNT_SRC_MAX_AGE_SECONDS = 86400
+
 # Legacy sandbox launcher directory (before migration to <config_dir>/run/).
 _LEGACY_LAUNCHER_DIR = "/tmp"
 
@@ -1785,6 +1792,21 @@ def main():
         _mount_or_die(None, b"/", _MS_REC | _MS_PRIVATE,
                       "making mount propagation private on /")
 
+        # Every staging temp below is a bind-mount SOURCE, so this launcher
+        # cannot unlink its own name: the kernel pins the source inode for the
+        # life of the mount, and the .ssh source becomes non-empty by design
+        # once known_hosts is restored through the mount (rmdir would fail
+        # ENOTEMPTY, and removing the entry would delete the file the agent
+        # needs). The names therefore outlive the mount namespace and only an
+        # outside sweeper can reclaim them, which is what this tag is for.
+        # This runs in the forked child, and that child is what execs the real
+        # agent; exec preserves the PID, so this PID is the agent's PID for as
+        # long as it lives. A dead PID therefore means the namespace is gone and
+        # the source is garbage — which is the janitor's liveness key.
+        # %-formatting, not an f-string: this body is emitted from an outer
+        # f-string where every literal brace must be doubled.
+        _sb_prefix = "kirocrew_sb_%d_" % os.getpid()
+
         # Pick a tmpfs-backed source dir for bind-mount empty files/dirs. Same-fs
         # binds (e.g. /tmp on ext4 over ~/.kiro/crew/.env on ext4) can corrupt the
         # target's host directory entry via a kernel propagation race when the
@@ -1802,7 +1824,7 @@ def main():
             try:
                 if _home_dev is not None and os.stat(_candidate).st_dev == _home_dev:
                     continue  # same fs as HOME — no isolation, race still possible
-                _probe = tempfile.mkdtemp(dir=_candidate, prefix="kirocrew_sb_")
+                _probe = tempfile.mkdtemp(dir=_candidate, prefix=_sb_prefix)
                 os.rmdir(_probe)
                 _tmpfs_src = _candidate
                 break
@@ -1861,7 +1883,7 @@ def main():
         for d in SENSITIVE_DIRS:
             target = d.encode()
             if os.path.isdir(target):
-                per_dir_empty = tempfile.mkdtemp(dir=_tmpfs_src).encode()
+                per_dir_empty = tempfile.mkdtemp(dir=_tmpfs_src, prefix=_sb_prefix).encode()
                 _mount_or_die(per_dir_empty, target, _MS_BIND,
                               "hiding credential directory %s" % d)
 
@@ -1900,7 +1922,7 @@ def main():
         for f in SENSITIVE_FILES:
             target = f.encode()
             if os.path.isfile(target):
-                fd, empty_path = tempfile.mkstemp(dir=_tmpfs_src)
+                fd, empty_path = tempfile.mkstemp(dir=_tmpfs_src, prefix=_sb_prefix)
                 os.close(fd)
                 _mount_or_die(empty_path.encode(), target, _MS_BIND,
                               "hiding sensitive file %s" % f)
@@ -1943,7 +1965,7 @@ def main():
                     raise
             # Cross-fs source for the same kernel-race reason as SENSITIVE_DIRS
             # (line 371) and SENSITIVE_FILES (line 389).
-            ssh_tmp = tempfile.mkdtemp(dir=_tmpfs_src).encode()
+            ssh_tmp = tempfile.mkdtemp(dir=_tmpfs_src, prefix=_sb_prefix).encode()
             _mount_or_die(ssh_tmp, SSH_DIR.encode(), _MS_BIND,
                           "hiding ssh key directory %s" % SSH_DIR)
             if kh_data:
@@ -2659,6 +2681,13 @@ def cleanup_stale_sandbox_profiles(*, legacy_dir: str | None = None) -> int:
     migration to <config_dir>/run/ — these have no PID segment, so only the
     age threshold applies.
 
+    Also reclaims the Linux namespace launcher's bind-mount source temps
+    (``kirocrew_sb_<pid>_*`` under /run/user/$UID, /dev/shm or the system temp
+    dir). Those are a different shape from the launcher scripts above: the
+    launcher cannot unlink them itself because the kernel pins a bind-mount
+    source for the life of the mount, so they are reclaimed by PID liveness
+    after the namespace is gone. See _cleanup_stale_sandbox_mount_sources.
+
     Called from the periodic cleanup sweep in session.py, offloaded to the
     maintenance executor (blocking I/O).  Safe to call from sync contexts too.
 
@@ -2735,7 +2764,91 @@ def cleanup_stale_sandbox_profiles(*, legacy_dir: str | None = None) -> int:
         except OSError:
             pass
 
+    removed += _cleanup_stale_sandbox_mount_sources()
     removed += _cleanup_retired_acp_snapshot_dir()
+    return removed
+
+
+def _sb_mount_source_dirs() -> list[str]:
+    """Directories the launcher may stage bind-mount sources in.
+
+    Mirrors the launcher's own candidate chain (``/run/user/$UID`` →
+    ``/dev/shm``) plus the system temp dir it falls through to when neither
+    tmpfs is usable. Deliberately NOT driven by ``TMPDIR``: the launcher
+    ignores it, because a source on the same filesystem as ``$HOME`` cannot
+    provide the cross-fs guarantee the bind relies on.
+    """
+    candidates = [f"/run/user/{os.getuid()}", "/dev/shm", tempfile.gettempdir()]
+    seen: set[str] = set()
+    out: list[str] = []
+    for path in candidates:
+        if path not in seen:
+            seen.add(path)
+            out.append(path)
+    return out
+
+
+def _cleanup_stale_sandbox_mount_sources() -> int:
+    """Reclaim bind-mount source temps left behind by the namespace launcher.
+
+    Sources are named ``kirocrew_sb_<pid>_*``. The tagged PID is the launcher's
+    forked child, which is what ``exec``s the agent, and ``exec`` preserves the
+    PID — so the tag is the live agent's PID and a dead PID means the namespace
+    is gone. Age is the backstop for a recycled PID.
+
+    Matches the ``kirocrew_sb_`` prefix ONLY. The legacy untagged residue is
+    bare ``tmp*``, which in ``/run/user/$UID``, ``/dev/shm`` and ``/tmp``
+    belongs to every other application on the box — sweeping that shape would
+    delete other programs' temps, so affected hosts need a one-time manual
+    sweep instead.
+
+    Returns:
+        Number of stale bind-mount sources removed.
+    """
+    now = time.time()
+    removed = 0
+    for src_dir in _sb_mount_source_dirs():
+        if not os.path.isdir(src_dir):
+            continue
+        try:
+            with os.scandir(src_dir) as it:
+                for dentry in it:
+                    if not dentry.name.startswith("kirocrew_sb_"):
+                        continue
+                    pid_str = dentry.name[len("kirocrew_sb_") :].split("_", 1)[0]
+                    if not pid_str.isdigit():
+                        continue
+                    # follow_symlinks=False throughout: a planted symlink named
+                    # kirocrew_sb_<deadpid>_x is stat'd and unlinked AS a
+                    # symlink, never followed, so its target is untouched.
+                    try:
+                        mtime = dentry.stat(follow_symlinks=False).st_mtime
+                    except OSError:
+                        continue
+                    if (now - mtime) > _SB_MOUNT_SRC_MAX_AGE_SECONDS:
+                        stale = True
+                    else:
+                        # Liveness probe via the shim — NEVER raw os.kill(pid, 0),
+                        # which TERMINATES the target on Windows.
+                        try:
+                            stale = not platform_compat.pid_exists(int(pid_str))
+                        except OverflowError:
+                            stale = True  # absurd PID digits — corrupt name
+                    if not stale:
+                        continue
+                    try:
+                        if dentry.is_dir(follow_symlinks=False):
+                            shutil.rmtree(dentry.path, ignore_errors=True)
+                        else:
+                            os.remove(dentry.path)
+                        removed += 1
+                    except OSError:
+                        # /dev/shm and /tmp are world-writable and sticky, so
+                        # another user's planted entry cannot be removed. That
+                        # failure is the correct outcome, not a bug to fix.
+                        pass
+        except OSError:
+            continue
     return removed
 
 

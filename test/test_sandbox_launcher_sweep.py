@@ -9,10 +9,14 @@ Verifies:
   (f) makedirs-failure falls back to system tmpdir
   (g) run_dir is created with mode 0o700
   (h) non-conforming filenames are left untouched
+  (i) the bind-mount source janitor reclaims dead-PID kirocrew_sb_* sources,
+      keeps live-PID ones, and never follows a planted symlink
+  (j) the generated launcher tags all four staging sites with _sb_prefix
 """
 
 from __future__ import annotations
 
+import ast
 import os
 import time
 from pathlib import Path
@@ -20,12 +24,29 @@ from unittest.mock import patch
 
 import pytest
 
+from kiro_crew import platform_compat
 from kiro_crew.sandbox import (
     _LAUNCHER_MAX_AGE_SECONDS,
+    _SB_MOUNT_SRC_MAX_AGE_SECONDS,
+    _build_launcher_script,
+    _cleanup_stale_sandbox_mount_sources,
     _ensure_run_dir,
     cleanup_stale_sandbox_profiles,
     namespace_argv,
 )
+
+
+def _dead_pid() -> int:
+    """A PID that is reliably not running, found by probing rather than hardcoded.
+
+    A hardcoded "obviously dead" number is a latent flake: on a host with a
+    raised ``pid_max`` it can genuinely be in use, and the test then asserts the
+    opposite of what it means to.
+    """
+    for candidate in range(4_000_000, 4_001_000):
+        if not platform_compat.pid_exists(candidate):
+            return candidate
+    raise AssertionError("no dead PID found in the probed range")
 
 
 @pytest.fixture()
@@ -56,6 +77,20 @@ def _isolated_legacy_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     empty = tmp_path / "isolated_legacy"
     empty.mkdir(exist_ok=True)
     monkeypatch.setattr("kiro_crew.sandbox._LEGACY_LAUNCHER_DIR", str(empty))
+    return empty
+
+
+@pytest.fixture(autouse=True)
+def _isolated_mount_source_dirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Point the bind-mount-source sweep at an empty per-test dir.
+
+    Without this, cleanup_stale_sandbox_profiles() would scan the REAL
+    /run/user/$UID, /dev/shm and system temp dir, so a unit test could delete
+    a live agent's staging temps on the developer's own machine.
+    """
+    empty = tmp_path / "isolated_mount_src"
+    empty.mkdir(exist_ok=True)
+    monkeypatch.setattr("kiro_crew.sandbox._sb_mount_source_dirs", lambda: [str(empty)])
     return empty
 
 
@@ -252,3 +287,181 @@ class TestCleanupSweep:
         """If ~/.kirocrew/run/ doesn't exist, no crash."""
         removed = cleanup_stale_sandbox_profiles()  # should not raise
         assert removed == 0
+
+
+class TestMountSourceSweep:
+    """_cleanup_stale_sandbox_mount_sources() reclaims the launcher's bind-mount sources.
+
+    The launcher stages one dir per hidden credential directory, one file per
+    hidden file, and one dir holding the exposed known_hosts copy. It cannot
+    unlink them itself (the kernel pins a bind-mount source for the life of the
+    mount), so they are reclaimed here by PID liveness once the namespace is gone.
+    """
+
+    def test_removes_dead_pid_dir_with_contents(self, _isolated_mount_source_dirs: Path):
+        """A non-empty dead-PID dir is removed — the real .ssh shape.
+
+        The staged .ssh source holds the known_hosts copy written through the
+        mount, so it is never empty. A naive os.rmdir implementation would fail
+        ENOTEMPTY here and leak exactly the entries that filled the tmpfs.
+        """
+        stale = _isolated_mount_source_dirs / f"kirocrew_sb_{_dead_pid()}_ssh0"
+        stale.mkdir()
+        (stale / "known_hosts").write_text("github.com ssh-ed25519 AAAA...\n")
+
+        removed = _cleanup_stale_sandbox_mount_sources()
+        assert not stale.exists()
+        assert removed == 1
+
+    def test_removes_dead_pid_file(self, _isolated_mount_source_dirs: Path):
+        """A dead-PID empty file source (the SENSITIVE_FILES shape) is removed."""
+        stale = _isolated_mount_source_dirs / f"kirocrew_sb_{_dead_pid()}_f0"
+        stale.write_bytes(b"")
+
+        removed = _cleanup_stale_sandbox_mount_sources()
+        assert not stale.exists()
+        assert removed == 1
+
+    def test_removes_over_age_live_pid(self, _isolated_mount_source_dirs: Path):
+        """Age is the backstop for a PID recycled after the launcher died."""
+        stale = _isolated_mount_source_dirs / f"kirocrew_sb_{os.getpid()}_old0"
+        stale.mkdir()
+        old_time = time.time() - _SB_MOUNT_SRC_MAX_AGE_SECONDS - 100
+        os.utime(stale, (old_time, old_time))
+
+        removed = _cleanup_stale_sandbox_mount_sources()
+        assert not stale.exists()
+        assert removed == 1
+
+    def test_keeps_live_pid_within_age_window(self, _isolated_mount_source_dirs: Path):
+        """A running agent's mount source is never disturbed."""
+        live = _isolated_mount_source_dirs / f"kirocrew_sb_{os.getpid()}_live0"
+        live.mkdir()
+        (live / "known_hosts").write_text("still mounted\n")
+
+        removed = _cleanup_stale_sandbox_mount_sources()
+        assert live.exists()
+        assert (live / "known_hosts").exists()
+        assert removed == 0
+
+    def test_keeps_legacy_bare_tmp_names(self, _isolated_mount_source_dirs: Path):
+        """Bare tmp* is left alone — it belongs to every other app on the box.
+
+        These dirs are world-writable (/dev/shm, /tmp) or shared with the whole
+        session (/run/user/$UID), so matching tmp* would delete other programs'
+        temps. Affected hosts get a documented one-time manual sweep instead.
+        """
+        legacy_dir = _isolated_mount_source_dirs / "tmpab12cd34"
+        legacy_dir.mkdir()
+        legacy_file = _isolated_mount_source_dirs / "tmpef56gh78"
+        legacy_file.write_bytes(b"")
+        old_time = time.time() - _SB_MOUNT_SRC_MAX_AGE_SECONDS - 100
+        os.utime(legacy_dir, (old_time, old_time))
+        os.utime(legacy_file, (old_time, old_time))
+
+        removed = _cleanup_stale_sandbox_mount_sources()
+        assert legacy_dir.exists()
+        assert legacy_file.exists()
+        assert removed == 0
+
+    def test_keeps_unparseable_pid(self, _isolated_mount_source_dirs: Path):
+        """A name whose PID segment is not digits is left to its owner."""
+        odd = _isolated_mount_source_dirs / "kirocrew_sb_notapid_x"
+        odd.mkdir()
+        old_time = time.time() - _SB_MOUNT_SRC_MAX_AGE_SECONDS - 100
+        os.utime(odd, (old_time, old_time))
+
+        removed = _cleanup_stale_sandbox_mount_sources()
+        assert odd.exists()
+        assert removed == 0
+
+    def test_keeps_launcher_scripts(self, _isolated_mount_source_dirs: Path):
+        """kirocrew_sandbox_* belongs to the other sweeper, not this one."""
+        launcher = _isolated_mount_source_dirs / "kirocrew_sandbox_1_x.py"
+        launcher.write_text("# launcher script")
+        old_time = time.time() - _SB_MOUNT_SRC_MAX_AGE_SECONDS - 100
+        os.utime(launcher, (old_time, old_time))
+
+        removed = _cleanup_stale_sandbox_mount_sources()
+        assert launcher.exists()
+        assert removed == 0
+
+    def test_sweep_is_idempotent(self, _isolated_mount_source_dirs: Path):
+        """A second pass finds nothing left to do."""
+        stale = _isolated_mount_source_dirs / f"kirocrew_sb_{_dead_pid()}_d0"
+        stale.mkdir()
+        (stale / "known_hosts").write_text("x\n")
+
+        assert _cleanup_stale_sandbox_mount_sources() == 1
+        assert _cleanup_stale_sandbox_mount_sources() == 0
+
+    def test_symlink_is_unlinked_and_target_survives(
+        self, _isolated_mount_source_dirs: Path, tmp_path: Path
+    ):
+        """A planted symlink is removed AS a symlink, never followed.
+
+        follow_symlinks=False on both the stat and the is_dir probe is the
+        security property: without it, a symlink named kirocrew_sb_<deadpid>_x
+        pointing at a real directory would have its TARGET rmtree'd.
+        """
+        target_dir = tmp_path / "precious"
+        target_dir.mkdir()
+        target_file = target_dir / "keep_me"
+        target_file.write_text("must survive")
+
+        planted = _isolated_mount_source_dirs / f"kirocrew_sb_{_dead_pid()}_link"
+        planted.symlink_to(target_dir, target_is_directory=True)
+
+        removed = _cleanup_stale_sandbox_mount_sources()
+        assert not planted.exists()
+        assert not planted.is_symlink()
+        assert removed == 1
+        assert target_dir.is_dir()
+        assert target_file.read_text() == "must survive"
+
+    def test_counted_in_cleanup_stale_sandbox_profiles(
+        self, fake_home: Path, _isolated_mount_source_dirs: Path
+    ):
+        """The public sweep includes mount-source removals in its returned count."""
+        run_dir = fake_home / ".kirocrew" / "run"
+        run_dir.mkdir(parents=True)
+        dead_launcher = run_dir / "kirocrew_sandbox_99999999_abc123.py"
+        dead_launcher.write_text("# dead launcher")
+
+        dead_source = _isolated_mount_source_dirs / f"kirocrew_sb_{_dead_pid()}_s0"
+        dead_source.mkdir()
+
+        removed = cleanup_stale_sandbox_profiles()
+        assert not dead_launcher.exists()
+        assert not dead_source.exists()
+        assert removed == 2
+
+    def test_missing_source_dir_is_noop(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """A candidate dir that does not exist is skipped, not an error."""
+        monkeypatch.setattr(
+            "kiro_crew.sandbox._sb_mount_source_dirs", lambda: [str(tmp_path / "nope")]
+        )
+        assert _cleanup_stale_sandbox_mount_sources() == 0
+
+
+class TestLauncherTagsMountSources:
+    """Part A reaches the generated launcher.
+
+    Asserted against the rendered script because the launcher body is emitted
+    from an outer f-string: a brace-rendering mistake would silently drop the
+    prefix and disable the whole fix with no test failing anywhere else.
+    """
+
+    @pytest.mark.parametrize("level", ["strict", "cc", "standard"])
+    def test_launcher_parses_and_tags_every_staging_site(self, level: str):
+        script = _build_launcher_script(level)
+
+        ast.parse(script)  # raises SyntaxError on a brace-rendering bug
+        assert "_sb_prefix = " in script
+
+        # Every staging call must carry prefix=. An untagged one is invisible to
+        # the janitor and leaks for the life of the host.
+        assert "mkdtemp(dir=_tmpfs_src)" not in script
+        assert "mkstemp(dir=_tmpfs_src)" not in script
+        assert "mkdtemp(dir=_candidate)" not in script
+        assert script.count("prefix=_sb_prefix") == 4
