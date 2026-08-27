@@ -2839,7 +2839,7 @@ class TestCleanupLoop:
         assert sweep_threads[0] != threading.main_thread().name
         assert sweep_threads[0].startswith("mc-maint")
         # Verify: non-zero return produces the info log
-        assert "removed 3 stale sandbox launchers" in caplog.text
+        assert "removed 3 stale sandbox artifacts" in caplog.text
         await mgr.close_all()
 
 

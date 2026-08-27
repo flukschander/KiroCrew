@@ -62,12 +62,36 @@ logger = logging.getLogger(__name__)
 # Any file older than this threshold is garbage regardless of PID liveness.
 _LAUNCHER_MAX_AGE_SECONDS = 3600
 
-# Bind-mount source temps staged by the Linux namespace launcher live as long
-# as the sandboxed agent runs, which can be hours — so PID liveness, not age,
-# is the primary reclaim signal. Age is only the backstop for a PID that was
-# recycled after the launcher died, hence a threshold well beyond any launcher
-# lifetime rather than the 1h used for exec-once launcher scripts.
-_SB_MOUNT_SRC_MAX_AGE_SECONDS = 86400
+# Bind-mount SOURCES staged by the namespace launcher (empty dirs/files bound
+# over credential paths, plus the SSH shadow dir). The kernel pins a source for
+# the mount's lifetime, so the launcher cannot unlink them and they orphan when
+# the sandboxed process exits. The launcher names them with this prefix plus
+# its own pid ("kirocrew_sb_<pid>_..."); the pid is the liveness key the
+# janitor probes. The age threshold backstops recycled pids for the removals
+# that stay safe against a live mount (plain files and empty dirs).
+_MOUNT_SOURCE_PREFIX = "kirocrew_sb_"
+_MOUNT_SOURCE_MAX_AGE_SECONDS = 24 * 3600
+
+# Pin-scan stabilization budget: a mount-namespace holder can fork a successor
+# and exit between the /proc listing and its own mountinfo read, so a pass
+# that observed a vanish rescans newly appeared pids; past this many passes
+# coverage is reported as unproven instead of looping.
+_PIN_SCAN_MAX_PASSES = 3
+# The overflow uid: what /proc/<pid> stats to for a process whose uid has no
+# mapping in the reader's user namespace. Such a holder CAN be binding our
+# sources, so it is a coverage gap, not a foreign user. The value is a
+# writable sysctl, so it is read from the host; an unreadable sysctl answers
+# None, and the scan then treats EVERY unreadable non-own uid as a gap.
+_OVERFLOW_UID_SYSCTL = "/proc/sys/kernel/overflowuid"
+
+
+@functools.lru_cache(maxsize=1)
+def _overflow_uid() -> int | None:
+    try:
+        return int(Path(_OVERFLOW_UID_SYSCTL).read_text().strip())
+    except (OSError, ValueError):
+        return None
+
 
 # Legacy sandbox launcher directory (before migration to <config_dir>/run/).
 _LEGACY_LAUNCHER_DIR = "/tmp"
@@ -1792,21 +1816,6 @@ def main():
         _mount_or_die(None, b"/", _MS_REC | _MS_PRIVATE,
                       "making mount propagation private on /")
 
-        # Every staging temp below is a bind-mount SOURCE, so this launcher
-        # cannot unlink its own name: the kernel pins the source inode for the
-        # life of the mount, and the .ssh source becomes non-empty by design
-        # once known_hosts is restored through the mount (rmdir would fail
-        # ENOTEMPTY, and removing the entry would delete the file the agent
-        # needs). The names therefore outlive the mount namespace and only an
-        # outside sweeper can reclaim them, which is what this tag is for.
-        # This runs in the forked child, and that child is what execs the real
-        # agent; exec preserves the PID, so this PID is the agent's PID for as
-        # long as it lives. A dead PID therefore means the namespace is gone and
-        # the source is garbage — which is the janitor's liveness key.
-        # %-formatting, not an f-string: this body is emitted from an outer
-        # f-string where every literal brace must be doubled.
-        _sb_prefix = "kirocrew_sb_%d_" % os.getpid()
-
         # Pick a tmpfs-backed source dir for bind-mount empty files/dirs. Same-fs
         # binds (e.g. /tmp on ext4 over ~/.kiro/crew/.env on ext4) can corrupt the
         # target's host directory entry via a kernel propagation race when the
@@ -1824,8 +1833,11 @@ def main():
             try:
                 if _home_dev is not None and os.stat(_candidate).st_dev == _home_dev:
                     continue  # same fs as HOME — no isolation, race still possible
-                _probe = tempfile.mkdtemp(dir=_candidate, prefix=_sb_prefix)
-                os.rmdir(_probe)
+                _probe = tempfile.mkdtemp(dir=_candidate, prefix="kirocrew_sbprobe_")
+                try:
+                    os.rmdir(_probe)
+                except FileNotFoundError:
+                    pass  # an external cleaner won the race — the root still works
                 _tmpfs_src = _candidate
                 break
             except (OSError, ValueError):
@@ -1834,6 +1846,17 @@ def main():
         # In that case we accept the kernel-race risk because no tmpfs is
         # available — better to function (with the original regression risk)
         # than to refuse to start.
+
+        # Tag every bind-mount SOURCE with this process's pid. The kernel pins
+        # a bind source for the mount's lifetime, so these entries cannot be
+        # unlinked here and are orphaned when the sandboxed process exits; the
+        # pid in the name is the liveness key the periodic janitor
+        # (_cleanup_stale_sandbox_mount_sources) probes to reclaim them. exec
+        # preserves the pid, so this pid IS the running agent's pid. The
+        # tmpfs probe above deliberately uses the sibling "kirocrew_sbprobe_"
+        # prefix, OUTSIDE the pid-parsed family, so the janitor never races
+        # its mkdtemp/rmdir window.
+        _src_prefix = "kirocrew_sb_%d_" % os.getpid()
 
         # Pre-read files that must survive dir hiding.
         #
@@ -1883,7 +1906,7 @@ def main():
         for d in SENSITIVE_DIRS:
             target = d.encode()
             if os.path.isdir(target):
-                per_dir_empty = tempfile.mkdtemp(dir=_tmpfs_src, prefix=_sb_prefix).encode()
+                per_dir_empty = tempfile.mkdtemp(dir=_tmpfs_src, prefix=_src_prefix).encode()
                 _mount_or_die(per_dir_empty, target, _MS_BIND,
                               "hiding credential directory %s" % d)
 
@@ -1922,7 +1945,7 @@ def main():
         for f in SENSITIVE_FILES:
             target = f.encode()
             if os.path.isfile(target):
-                fd, empty_path = tempfile.mkstemp(dir=_tmpfs_src, prefix=_sb_prefix)
+                fd, empty_path = tempfile.mkstemp(dir=_tmpfs_src, prefix=_src_prefix)
                 os.close(fd)
                 _mount_or_die(empty_path.encode(), target, _MS_BIND,
                               "hiding sensitive file %s" % f)
@@ -1965,7 +1988,7 @@ def main():
                     raise
             # Cross-fs source for the same kernel-race reason as SENSITIVE_DIRS
             # (line 371) and SENSITIVE_FILES (line 389).
-            ssh_tmp = tempfile.mkdtemp(dir=_tmpfs_src, prefix=_sb_prefix).encode()
+            ssh_tmp = tempfile.mkdtemp(dir=_tmpfs_src, prefix=_src_prefix).encode()
             _mount_or_die(ssh_tmp, SSH_DIR.encode(), _MS_BIND,
                           "hiding ssh key directory %s" % SSH_DIR)
             if kh_data:
@@ -2667,6 +2690,25 @@ def _sandbox_env_unset_args(sandbox_level: str, strip_python_env: bool) -> list[
     return unset_args
 
 
+def _parse_pid_segment(pid_str: str) -> int | None:
+    """Parse a pid segment from a sweep-owned filename, or None to skip.
+
+    Both sweeps (launcher scripts and mount sources) only ever WRITE an ASCII
+    positive decimal pid, so anything else is a foreign or planted name and
+    must fail toward "skip": non-ASCII decimals (``int()`` would accept
+    them), pid ``0`` (``os.kill(0, 0)`` probes the caller's own process group
+    and always reads alive), zero-padded segments, and — belt-and-braces,
+    NAME_MAX keeps real names far shorter than the int/str conversion limit —
+    a ``ValueError`` from ``int()`` itself.
+    """
+    if not pid_str.isascii() or not pid_str.isdecimal() or pid_str.startswith("0"):
+        return None
+    try:
+        return int(pid_str)
+    except ValueError:
+        return None
+
+
 def cleanup_stale_sandbox_profiles(*, legacy_dir: str | None = None) -> int:
     """Remove orphan sandbox files from <config_dir>/run/ and legacy /tmp.
 
@@ -2679,14 +2721,8 @@ def cleanup_stale_sandbox_profiles(*, legacy_dir: str | None = None) -> int:
 
     Also sweeps legacy /tmp/kirocrew_sandbox_*.py files that predate the
     migration to <config_dir>/run/ — these have no PID segment, so only the
-    age threshold applies.
-
-    Also reclaims the Linux namespace launcher's bind-mount source temps
-    (``kirocrew_sb_<pid>_*`` under /run/user/$UID, /dev/shm or the system temp
-    dir). Those are a different shape from the launcher scripts above: the
-    launcher cannot unlink them itself because the kernel pins a bind-mount
-    source for the life of the mount, so they are reclaimed by PID liveness
-    after the namespace is gone. See _cleanup_stale_sandbox_mount_sources.
+    age threshold applies — plus the orphaned bind-mount sources the namespace
+    launcher stages on tmpfs (see _cleanup_stale_sandbox_mount_sources).
 
     Called from the periodic cleanup sweep in session.py, offloaded to the
     maintenance executor (blocking I/O).  Safe to call from sync contexts too.
@@ -2726,15 +2762,15 @@ def cleanup_stale_sandbox_profiles(*, legacy_dir: str | None = None) -> int:
                 continue
             # Fresh file — fall back to PID liveness check
             middle = entry[len("kirocrew_sandbox_") : -len(suffix)]
-            pid_str = middle.split("_", 1)[0]
-            if not pid_str.isdigit():
+            pid = _parse_pid_segment(middle.split("_", 1)[0])
+            if pid is None:
                 continue
             # Liveness probe via the shim — NEVER raw os.kill(pid, 0), which
             # TERMINATES the target process on Windows (see platform_compat).
             try:
-                alive = platform_compat.pid_exists(int(pid_str))
+                alive = platform_compat.pid_exists(pid)
             except OverflowError:
-                alive = False  # absurd PID digits from a corrupt filename — stale
+                alive = False  # absurd pid digits from a corrupt filename — stale
             if not alive:
                 try:
                     os.remove(filepath)
@@ -2769,86 +2805,266 @@ def cleanup_stale_sandbox_profiles(*, legacy_dir: str | None = None) -> int:
     return removed
 
 
-def _sb_mount_source_dirs() -> list[str]:
-    """Directories the launcher may stage bind-mount sources in.
+def _mount_source_candidate_roots() -> list[str]:
+    """The tmpfs roots the namespace launcher stages bind-mount sources on.
 
-    Mirrors the launcher's own candidate chain (``/run/user/$UID`` →
-    ``/dev/shm``) plus the system temp dir it falls through to when neither
-    tmpfs is usable. Deliberately NOT driven by ``TMPDIR``: the launcher
-    ignores it, because a source on the same filesystem as ``$HOME`` cannot
-    provide the cross-fs guarantee the bind relies on.
+    Mirrors the launcher's own ``_tmpfs_src`` candidate chain —
+    ``/run/user/$UID``, ``/dev/shm``, then the system default tempdir (the
+    ``_tmpfs_src=None`` fallback). The tempdir entry is the gateway's own
+    ``tempfile.gettempdir()``, which matches the launcher's fallback only while
+    both resolve the same ``TMPDIR``; a launcher spawned with a divergent,
+    persistent ``TMPDIR`` stages its fallback entries somewhere this sweep
+    never visits, and nothing else reclaims them — a real limitation, reached
+    only when NO tmpfs candidate exists at all. ``os.getuid`` is
+    POSIX-only; the launcher itself is Linux-only, so a platform without it
+    simply has no per-user runtime root to sweep.
     """
-    candidates = [f"/run/user/{os.getuid()}", "/dev/shm", tempfile.gettempdir()]
+    roots: list[str] = []
+    getuid = getattr(os, "getuid", None)
+    if getuid is not None:
+        roots.append(f"/run/user/{getuid()}")
+    roots.append("/dev/shm")
+    roots.append(tempfile.gettempdir())
+    return roots
+
+
+def _mount_pinned_source_names(proc_root: str = "/proc") -> tuple[set[str], bool]:
+    """Entry names of sandbox mount sources referenced by a live mount, plus
+    whether the scan positively covered every namespace a PROCESS could be
+    binding one from.
+
+    A bind mount records its source as the ``root`` field (field 4) of a
+    ``/proc/<pid>/mountinfo`` line, and the staged sources are direct children
+    of a tmpfs root, so the basename of that field is the staged entry's name
+    (mkdtemp names carry no spaces, so mountinfo's octal escaping never
+    applies to them). Only prefix-shaped basenames are collected — a foreign
+    mount whose root merely resembles a path cannot pin anything. Keying is by
+    basename, so two identically-named entries on different roots would share
+    a pin; mkdtemp's random suffix makes that vanishingly rare, and the error
+    lands on the retention side.
+
+    The launcher's mounts live in the sandboxed child's PRIVATE namespace —
+    invisible in the gateway's own mountinfo — and that namespace can outlive
+    the launcher pid through any surviving descendant (a build daemon, for
+    example), so every readable pid's mountinfo is consulted. Coverage is
+    what makes the answer usable, and it is established positively:
+
+    - The listing must show pid 1. ``hidepid``/``subset=pid`` procfs hides
+      other users' processes entirely — including a root holder that entered
+      a sandbox namespace — and pid 1 always exists, so its absence proves
+      the listing is filtered and the scan reports incomplete.
+    - A holder can fork a successor and exit between the pid listing and its
+      own mountinfo read (the read then raises FileNotFoundError). The
+      successor was forked BEFORE the exit, so it is visible to the very next
+      listing: the scan re-lists after any pass that observed a vanish, and
+      finishes on a pass that saw none. A pid appearing WITHOUT a vanish
+      needs no rescan — it is either in a namespace whose surviving holders
+      this scan already read, or in a brand-new namespace, which can only
+      bind brand-new (fresh, live-pid) entries that are never reclaim
+      candidates in the same sweep. A scan still churning after
+      ``_PIN_SCAN_MAX_PASSES`` cannot prove coverage and reports incomplete.
+      (A successor recycled onto an already-seen pid NUMBER inside this
+      window escapes the re-listing; that needs the full pid space to wrap
+      within the scan's milliseconds, and the residual error is
+      retention-side only on the next sweep.)
+    - A read failure is forgiven ONLY when the pid provably belongs to a
+      DIFFERENT real user (its ``/proc/<pid>`` stats to a uid that is not
+      ours, not root, and not the host's overflow uid) — such a process
+      cannot be binding a source this uid staged, because the sandboxed child
+      keeps this uid and NO_NEW_PRIVS. Root can enter any namespace, and a
+      holder in a foreign user namespace stats as the overflow uid, so those
+      count as coverage gaps.
+
+    A namespace held only by an nsfs fd or a bind-mounted ``ns/mnt`` — zero
+    member processes — has no mountinfo to scan and is out of scope; the
+    launcher never creates one. ``complete=False`` means absence-of-pin was
+    NOT established; the caller must not remove directory entries or destroy
+    contents on the strength of it.
+    """
+    pinned: set[str] = set()
+    complete = True
     seen: set[str] = set()
-    out: list[str] = []
-    for path in candidates:
-        if path not in seen:
-            seen.add(path)
-            out.append(path)
-    return out
+    getuid = getattr(os, "getuid", None)
+    own_uid = getuid() if getuid is not None else None
+    overflow_uid = _overflow_uid()
+
+    for _ in range(_PIN_SCAN_MAX_PASSES):
+        try:
+            listed = [n for n in os.listdir(proc_root) if n.isdecimal()]
+        except OSError:
+            return pinned, False
+        if "1" not in listed and "1" not in seen:
+            return pinned, False  # filtered procfs (hidepid/subset) — coverage unprovable
+        new_pids = [n for n in listed if n not in seen]
+        vanished = False
+        for name in new_pids:
+            seen.add(name)
+            try:
+                with open(
+                    os.path.join(proc_root, name, "mountinfo"),
+                    encoding="utf-8",
+                    errors="replace",
+                ) as fh:
+                    for line in fh:
+                        if _MOUNT_SOURCE_PREFIX not in line:
+                            continue
+                        fields = line.split()
+                        if len(fields) > 3:
+                            source = os.path.basename(fields[3])
+                            if source.startswith(_MOUNT_SOURCE_PREFIX):
+                                pinned.add(source)
+            except (FileNotFoundError, ProcessLookupError):
+                # May have handed its namespace to a child forked before the
+                # exit — visible to the next listing, so take another pass.
+                vanished = True
+            except OSError:
+                try:
+                    st_uid: int | None = os.stat(os.path.join(proc_root, name)).st_uid
+                except OSError:
+                    st_uid = None
+                if (
+                    own_uid is None
+                    or st_uid is None
+                    or overflow_uid is None
+                    or st_uid == own_uid
+                    or st_uid == 0
+                    or st_uid == overflow_uid
+                ):
+                    complete = False
+        if not vanished:
+            return pinned, complete
+    return pinned, False  # still churning after the pass budget — coverage unproven
 
 
-def _cleanup_stale_sandbox_mount_sources() -> int:
-    """Reclaim bind-mount source temps left behind by the namespace launcher.
+def _cleanup_stale_sandbox_mount_sources(*, roots: Sequence[str] | None = None) -> int:
+    """Reclaim orphaned bind-mount sources staged by the namespace launcher.
 
-    Sources are named ``kirocrew_sb_<pid>_*``. The tagged PID is the launcher's
-    forked child, which is what ``exec``s the agent, and ``exec`` preserves the
-    PID — so the tag is the live agent's PID and a dead PID means the namespace
-    is gone. Age is the backstop for a recycled PID.
+    The launcher stages one empty dir per SENSITIVE_DIRS entry, one empty file
+    per SENSITIVE_FILES entry, and (strict only) an SSH shadow dir holding a
+    known-hosts copy, all named ``kirocrew_sb_<pid>_*`` on a tmpfs root. The
+    kernel pins each source while its bind-mount lives, so the launcher cannot
+    remove them and they orphan when the sandboxed process exits. Left alone
+    they exhaust the runtime tmpfs (``/run/user/$UID``), at which point the
+    systemd user manager cannot allocate transient scope units and every
+    ``systemd-run --scope``-wrapped spawn fails.
 
-    Matches the ``kirocrew_sb_`` prefix ONLY. The legacy untagged residue is
-    bare ``tmp*``, which in ``/run/user/$UID``, ``/dev/shm`` and ``/tmp``
-    belongs to every other application on the box — sweeping that shape would
-    delete other programs' temps, so affected hosts need a one-time manual
-    sweep instead.
+    An entry becomes a reclaim candidate when its embedded pid is dead, or
+    past ``_MOUNT_SOURCE_MAX_AGE_SECONDS`` (the backstop for a pid recycled
+    onto an unrelated live process — routine on a ``pid_max=32768`` host).
+    What a candidate's removal may touch is then decided by kind, because a
+    bind source is NOT protected by the kernel against the sweeper: removing
+    it succeeds from this namespace (mountinfo then shows ``//deleted``), a
+    removed source DIRECTORY leaves the live mount's root inode ``S_DEAD`` so
+    every create under the masked path fails from then on, and a non-empty
+    dir's contents are visible inside any namespace still binding it:
+
+    - Plain files: ``os.remove``. A file source's inode is held by the mount
+      like an open descriptor, so the masked view is unaffected.
+    - Dirs, empty or not: removed only when no readable mount namespace
+      references the entry AND the pin scan positively covered every
+      namespace that could bind one (:func:`_mount_pinned_source_names`).
+      The pin scan, not the pid probe, is the deciding evidence: a recycled
+      pid reads live yet has no mount, so its entry is still reclaimed after
+      the age backstop rather than stranded, while a genuine long-lived
+      sandbox is pinned by its own process and kept. A namespace no PROCESS
+      holds has no mountinfo to report a pin — an fd- or bind-pinned
+      namespace with zero members is out of scope, and the launcher never
+      creates one — so the scan cannot go stale in the deleting direction. The
+      fresh-and-alive skip above stays load-bearing for the launcher's own
+      staging window (after ``mkdtemp``, before ``mount``), when its entries
+      are legitimately live and not yet pinned.
+
+    Deliberately conservative about names: only the recognized
+    ``kirocrew_sb_<pid>_`` shape with an ASCII positive pid is touched.
+    Foreign ``tmp*`` names carry no liveness key and are left alone, as are
+    ``kirocrew_sandbox_*`` launcher scripts, the ``kirocrew_sbprobe_*`` tmpfs
+    probe, and prefix matches whose segment is not an ASCII positive decimal
+    (an oversized all-digit segment IS the recognized shape — it probes
+    OverflowError, reads stale, and is reclaimed). Some of these roots are
+    world-writable, so a planted entry — including a deep tree built to make
+    ``rmtree`` recurse — must fail toward "skip", never toward an exception
+    that kills the sweep.
 
     Returns:
-        Number of stale bind-mount sources removed.
+        Number of entries removed.
     """
     now = time.time()
+    if roots is None:
+        roots = _mount_source_candidate_roots()
+    # (pinned set, scan-was-complete) — built lazily, once, on the first
+    # directory candidate (empty ones included: rmdir is gated too).
+    pin_scan: tuple[set[str], bool] | None = None
     removed = 0
-    for src_dir in _sb_mount_source_dirs():
-        if not os.path.isdir(src_dir):
-            continue
+    dirs_held_back = 0
+    for root in roots:
         try:
-            with os.scandir(src_dir) as it:
-                for dentry in it:
-                    if not dentry.name.startswith("kirocrew_sb_"):
-                        continue
-                    pid_str = dentry.name[len("kirocrew_sb_") :].split("_", 1)[0]
-                    if not pid_str.isdigit():
-                        continue
-                    # follow_symlinks=False throughout: a planted symlink named
-                    # kirocrew_sb_<deadpid>_x is stat'd and unlinked AS a
-                    # symlink, never followed, so its target is untouched.
-                    try:
-                        mtime = dentry.stat(follow_symlinks=False).st_mtime
-                    except OSError:
-                        continue
-                    if (now - mtime) > _SB_MOUNT_SRC_MAX_AGE_SECONDS:
-                        stale = True
-                    else:
-                        # Liveness probe via the shim — NEVER raw os.kill(pid, 0),
-                        # which TERMINATES the target on Windows.
-                        try:
-                            stale = not platform_compat.pid_exists(int(pid_str))
-                        except OverflowError:
-                            stale = True  # absurd PID digits — corrupt name
-                    if not stale:
-                        continue
-                    try:
-                        if dentry.is_dir(follow_symlinks=False):
-                            shutil.rmtree(dentry.path, ignore_errors=True)
-                        else:
-                            os.remove(dentry.path)
-                        removed += 1
-                    except OSError:
-                        # /dev/shm and /tmp are world-writable and sticky, so
-                        # another user's planted entry cannot be removed. That
-                        # failure is the correct outcome, not a bug to fix.
-                        pass
+            entries = os.listdir(root)
         except OSError:
             continue
+        for entry in entries:
+            if not entry.startswith(_MOUNT_SOURCE_PREFIX):
+                continue
+            pid_str, sep, _rest = entry[len(_MOUNT_SOURCE_PREFIX) :].partition("_")
+            pid = _parse_pid_segment(pid_str) if sep else None
+            if pid is None:
+                continue  # foreign / probe / planted names — no liveness key
+            path = os.path.join(root, entry)
+            try:
+                mtime = os.lstat(path).st_mtime
+            except OSError:
+                continue
+            over_age = (now - mtime) > _MOUNT_SOURCE_MAX_AGE_SECONDS
+            # Liveness probe via the shim — NEVER raw os.kill(pid, 0), which
+            # TERMINATES the target on Windows (platform_compat).
+            try:
+                alive = platform_compat.pid_exists(pid)
+            except OverflowError:
+                alive = False  # absurd pid digits from a corrupt name — stale
+            if alive and not over_age:
+                continue
+            if os.path.isdir(path) and not os.path.islink(path):
+                # ANY dir removal — even rmdir of an empty one — S_DEADs a
+                # live mount's root inode, so the pin scan gates it all.
+                if pin_scan is None:
+                    pin_scan = _mount_pinned_source_names()
+                pinned, scan_complete = pin_scan
+                if entry in pinned or not scan_complete:
+                    dirs_held_back += 1
+                    continue
+                try:
+                    os.rmdir(path)
+                    removed += 1
+                    continue
+                except OSError:
+                    pass
+                try:
+                    shutil.rmtree(path, ignore_errors=True)
+                except Exception:
+                    continue  # e.g. a planted tree deep enough to exhaust recursion
+                # ignore_errors swallows a partial failure — count only a
+                # confirmed removal.
+                if not os.path.lexists(path):
+                    removed += 1
+            else:
+                try:
+                    os.remove(path)
+                    removed += 1
+                except OSError:
+                    pass
+    if dirs_held_back:
+        # An always-closed pin scan is otherwise indistinguishable from a
+        # working one while the dominant (directory) leak class re-accumulates
+        # — surface it so an operator can tell retention from reclamation.
+        pinned_note = (
+            "pinned by a live mount namespace"
+            if pin_scan is not None and pin_scan[1]
+            else "pin scan incomplete"
+        )
+        logger.info(
+            "sandbox mount-source sweep: %d dir candidate(s) held back (%s)",
+            dirs_held_back,
+            pinned_note,
+        )
     return removed
 
 

@@ -47,23 +47,6 @@ _POSIX_ONLY = pytest.mark.skipif(
 
 
 @pytest.fixture(autouse=True)
-def _isolated_mount_source_dirs(tmp_path, monkeypatch):
-    """Point the bind-mount-source sweep at an empty per-test dir.
-
-    cleanup_stale_sandbox_profiles() now also reclaims the launcher's
-    ``kirocrew_sb_<pid>_*`` sources, which live in the REAL /run/user/$UID,
-    /dev/shm and system temp dir. Two tests here patch
-    ``platform_compat.pid_exists`` to return False, which would mark every
-    such entry on the developer's own machine stale and delete a live agent's
-    staging temps out from under it.
-    """
-    empty = tmp_path / "isolated_mount_src"
-    empty.mkdir(exist_ok=True)
-    monkeypatch.setattr("kiro_crew.sandbox._sb_mount_source_dirs", lambda: [str(empty)])
-    return empty
-
-
-@pytest.fixture(autouse=True)
 def clean_backend(monkeypatch):
     """Reset cached backend between tests.
 

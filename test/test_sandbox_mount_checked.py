@@ -171,6 +171,9 @@ def _run(
         "sys": sys,
         "tempfile": tempfile,
         "_tmpfs_src": str(src_dir),
+        # Defined by the launcher alongside _tmpfs_src, before this region: the
+        # pid-bearing prefix tagging every bind-mount source for the janitor.
+        "_src_prefix": "kirocrew_sb_%d_" % os.getpid(),
         "expose_data": {},
         "EXPOSE_FILES": [],
         "SENSITIVE_DIRS": [str(aws)],

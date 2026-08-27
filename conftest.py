@@ -13,7 +13,7 @@ test collected from any testpath, because what they protect is the
 developer's machine rather than the correctness of one suite. Everything that is
 merely suite-specific isolation stays in ``test/conftest.py``.
 
-The floor has six parts, and each one exists because the "remember to isolate
+The floor has seven parts, and each one exists because the "remember to isolate
 this" contract failed at least once:
 
 * **Services.** ``$XDG_CONFIG_HOME`` is redirected and the stdlib spawn funnels
@@ -43,6 +43,11 @@ this" contract failed at least once:
   base is additionally moved to ``/tmp`` -- the prefix Linux and CI already use --
   because the launchd per-user temp dir is long enough to break an AF_UNIX bind and
   random enough to read as a credential. See :data:`_SHORT_TMP_BASE`.
+* **The sandbox mount-source sweep.** The periodic janitor's candidate roots
+  (the operator's real ``/run/user/$UID`` and ``/dev/shm``) and its /proc pin
+  scan are both pinned to inert stand-ins -- the roots to an empty directory,
+  the scan to fail-closed -- so no test deletes real orphaned bind-mount
+  sources from the developer's machine or depends on host process state.
 * **The repository checkout.** The run fails when it ends with residue anywhere in
   the checkout, which is how a subprocess spawned without ``cwd=`` announces
   itself.
@@ -390,6 +395,86 @@ def _isolate_launchd_paths(_xdg_config_root, monkeypatch):
             continue
         for attr, value in attrs.items():
             monkeypatch.setattr(already, attr, value, raising=False)
+
+
+#: Originals of the sandbox-sweep functions the host-isolation floor patches,
+#: stashed here (conftest-owned) rather than as attributes on the production
+#: module. Tests reach them via the ``sandbox_sweep_original`` fixture — a
+#: fixture rather than an importable name, because ``import conftest`` from a
+#: test resolves to ``test/conftest.py``, not this rootdir file.
+_SANDBOX_SWEEP_ORIGINALS: dict = {}
+
+
+@pytest.fixture()
+def sandbox_sweep_original():
+    """Accessor for the pre-patch sandbox-sweep functions stashed by the floor."""
+    return _SANDBOX_SWEEP_ORIGINALS.__getitem__
+
+
+@pytest.fixture(scope="session")
+def _sandbox_mount_source_root(tmp_path_factory):
+    """An empty stand-in tmpfs root for the sandbox mount-source sweep.
+
+    Session-scoped and owned by no individual test, because nothing ever writes
+    into it -- it exists only so the sweep has a harmless directory to scan.
+    """
+    return tmp_path_factory.mktemp("sb-mount-src")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_sandbox_mount_source_roots(_sandbox_mount_source_root, monkeypatch):
+    """Point the sandbox mount-source sweep away from the host's real tmpfs.
+
+    ``sandbox._cleanup_stale_sandbox_mount_sources()`` -- reached from every
+    ``cleanup_stale_sandbox_profiles()`` call, including the periodic sweep in
+    ``session.py`` -- resolves its candidate roots from the REAL host:
+    ``/run/user/$UID``, ``/dev/shm``, and the system tempdir. The tempdir is
+    already redirected by the floor above, but the first two are the operator's
+    live runtime tmpfs, so an unpinned test would (a) delete real orphaned
+    bind-mount sources from the developer's machine -- a host mutation, however
+    garbage-shaped -- and (b) have its removal COUNT inflated by whatever real
+    orphans the host happens to carry, turning exact-count assertions into
+    host-state-dependent flakes.
+
+    A test that wants the sweep's real behaviour passes ``roots=`` explicitly or
+    monkeypatches ``_mount_source_candidate_roots`` itself (a later patch wins
+    and reverts independently); the real function stays reachable through this
+    conftest's ``sandbox_sweep_original`` accessor so its resolution logic
+    remains testable without mutating the production module.
+
+    Eagerly imported -- ``sandbox`` is a low-level dependency most of the suite
+    already pulls in, so this costs nothing and a lazy patch would leave the
+    first importer unprotected -- but tolerant of a partial checkout: an
+    unimportable module is skipped rather than failing collection. The setattr
+    itself is STRICT: a silent miss on a renamed attribute would revert the
+    whole suite to sweeping the operator's real tmpfs, which is exactly what
+    this fixture exists to prevent.
+    """
+    try:
+        sandbox_mod = importlib.import_module("kiro_crew.sandbox")
+    except Exception:  # pragma: no cover - a partial checkout must not break collection
+        return
+    _SANDBOX_SWEEP_ORIGINALS.setdefault(
+        "_mount_source_candidate_roots", sandbox_mod._mount_source_candidate_roots
+    )
+    monkeypatch.setattr(
+        sandbox_mod,
+        "_mount_source_candidate_roots",
+        lambda: [str(_sandbox_mount_source_root)],
+    )
+    # Second half of the same floor: the pin scan reads the operator's real
+    # /proc. Default it to fail-closed (nothing pinned, coverage unproven) so
+    # a test that forgets to fix the scan's answer is INERT -- the sweep then
+    # refuses to remove directories -- instead of silently depending on host
+    # /proc state. A test fixes the answer by monkeypatching
+    # ``_mount_pinned_source_names`` itself; ``TestMountPinnedSourceNames``
+    # imports the function by name at module import, so the parser's own unit
+    # tests are unaffected by this module-attribute patch.
+    monkeypatch.setattr(
+        sandbox_mod,
+        "_mount_pinned_source_names",
+        lambda proc_root="/proc": (set(), False),
+    )
 
 
 @pytest.fixture(autouse=True)
